@@ -717,6 +717,11 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
 $CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+# Seed the recorded report paths the same way. These drive consolidation so a
+# -Resume run bundles earlier subs' reports, not just the ones it processed.
+# Empty for state files written before this key existed; consolidation then
+# falls back to timestamp-only selection.
+$CompletedSubs = Get-CompletedSubscriptions -Path $ResumeStateFile -Tenant $TenantID
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
@@ -748,6 +753,10 @@ if ($Resume -or $ResumeFailedOnly)
                 $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
+                foreach ($Report in @($Obj.CompletedReports | Where-Object { $_ -and $_.ZipPath }))
+                {
+                    $CompletedSubs = Add-CompletedSubscription -Existing $CompletedSubs -Id $Report.Id -Name $Report.Name -ZipPath $Report.ZipPath
+                }
             }
             catch
             {
@@ -767,7 +776,7 @@ if ($Resume -or $ResumeFailedOnly)
             # Heal the unified file immediately so even a re-interrupted run keeps
             # the recovered picture. Per-stream files are intentionally left for
             # the end-of-run merge to reconcile and clean up.
-            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
         }
     }
 }
@@ -988,6 +997,10 @@ if ($ParallelStreams -le 1)
 
         try
         {
+            # Clear before the call: the inner script runs via & so this global
+            # persists across iterations, and a sub that fails before packaging
+            # would otherwise inherit the previous sub's ZIP path.
+            $Global:ZipOutputFile = $null
             & (Join-Path $PSScriptRoot "ResourceInventory.ps1") -TenantID $TenantID -SubscriptionID $Sub.Id @InventoryPassthrough -RunAllSubs
             # Only treat as failure if the inner script set a non-zero exit code.
             # Some completion paths leave $LASTEXITCODE unset ($null), and
@@ -1034,12 +1047,20 @@ if ($ParallelStreams -le 1)
                 $CompletedIds += $Sub.Id
                 $StateChanged = $true
             }
+            # Record where this sub's report landed so a later -Resume run can
+            # consolidate it. The inner script sets $Global:ZipOutputFile in this
+            # scope; a re-run refreshes the path, so always persist when we have one.
+            if (-not [string]::IsNullOrWhiteSpace($Global:ZipOutputFile))
+            {
+                $CompletedSubs = Add-CompletedSubscription -Existing $CompletedSubs -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile
+                $StateChanged = $true
+            }
             $BeforeFailedCount = @($FailedAttempts).Count
             $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
             if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
             if ($StateChanged)
             {
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
             }
         }
         catch
@@ -1128,7 +1149,7 @@ if ($ParallelStreams -le 1)
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                 -Id $Sub.Id -Name $Sub.Name `
                 -Reason $ErrRecord.Exception.Message
-            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
         }
 
         Write-Host "-----------------------------------" -ForegroundColor Gray
@@ -1207,7 +1228,7 @@ else
                 {
                     $CompletedIds += $Sub.Id
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
-                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
                 }
             }
             catch
@@ -1238,7 +1259,7 @@ else
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                     -Id $Sub.Id -Name $Sub.Name `
                     -Reason $ErrRecord.Exception.Message
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
             }
         }
         # Skip the parallel orchestration entirely; fall through to the
@@ -1538,6 +1559,13 @@ else
                     {
                         $AllFailedFromStreams += @($Obj.FailedAttempts)
                     }
+                    # Fold in each stream's report paths before the per-stream
+                    # files are deleted below, otherwise consolidation on a later
+                    # -Resume cannot locate this run's output.
+                    foreach ($Report in @($Obj.CompletedReports | Where-Object { $_ -and $_.ZipPath }))
+                    {
+                        $CompletedSubs = Add-CompletedSubscription -Existing $CompletedSubs -Id $Report.Id -Name $Report.Name -ZipPath $Report.ZipPath
+                    }
                 }
                 catch
                 {
@@ -1551,9 +1579,9 @@ else
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0)
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or @($CompletedSubs).Count -gt 0)
             {
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Completed $CompletedSubs
             }
             # Also delete per-stream resume files now that the unified file holds
             # the truth - this prevents drift if a future run uses a different
@@ -1624,8 +1652,8 @@ Write-Host "All subscriptions processed!" -ForegroundColor Green
 # number of per-subscription zip files written by this invocation is lower
 # than the number of subscriptions that ran to completion this invocation.
 #
-# Why this matters. The consolidation step below globs `*.zip` under
-# $InventoryRoot. If a per-sub zip is missing for any reason - antivirus
+# Why this matters. The consolidation step below bundles the per-sub zips
+# under $InventoryRoot. If one is missing for any reason - antivirus
 # quarantine, Cloud Shell ephemeral-storage eviction between worker exit and
 # wrapper consolidation, a worker that crashed after the inner script logged
 # completion but before its zip flushed, an out-of-disk-space write that the
@@ -1681,20 +1709,37 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
     Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {0} successful sub(s))" -f $ActualZipCount) -ForegroundColor Green
 }
 
+# Report folders recorded by earlier runs of this logical run. Derived from the
+# recorded ZIP paths (a per-sub ZIP sits inside its report folder) and used to
+# scope the main summary and the folded HTML to the whole run, not just this
+# invocation. Empty on a fresh run and for pre-existing resume-state files.
+$RecordedSubDirs = @($CompletedSubs | Where-Object { $_ -and $_.ZipPath } | ForEach-Object { Split-Path -Path $_.ZipPath -Parent } | Select-Object -Unique)
+
 # Consolidate per-subscription ZIPs into a single outer ZIP
 $OuterZipFile = $null
 
 if (Test-Path -Path $InventoryRoot -PathType Container)
 {
-    # Filter ZIPs by current run timestamp only
-    $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # ZIPs written this run, plus those recorded by earlier runs of the same
+    # logical run. Timestamp alone truncated the bundle on -Resume: skipped subs
+    # keep their original LastWriteTime and fell outside the window.
+    $SubZips = @(Get-ConsolidationZipSet -InventoryRoot $InventoryRoot -SinceTime $RunStartTime -RecordedCompleted $CompletedSubs)
     if ($SubZips.Count -gt 0)
     {
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $OuterZipFile = Join-Path $InventoryRoot "AllSubscriptions_ResourcesReport_$Timestamp.zip"
         Write-Host ("Compressing {0} per-subscription report(s) into: {1}" -f $SubZips.Count, $OuterZipFile) -ForegroundColor Cyan
-        Compress-Archive -Path $SubZips.FullName -DestinationPath $OuterZipFile -Force
+        Compress-Archive -Path $SubZips -DestinationPath $OuterZipFile -Force
         Write-Host ("Reporting Data File: {0}" -f $OuterZipFile) -ForegroundColor Green
+
+        # Warn loudly if the bundle covers fewer subs than the run accounts for.
+        # The old timestamp-only selection failed this silently on every -Resume.
+        $AccountedFor = @(@($CompletedIds) + @($SubResourceCounts | ForEach-Object { $_.Id }) | Select-Object -Unique).Count
+        if ($SubZips.Count -lt $AccountedFor)
+        {
+            Write-Host ("WARNING: consolidated bundle holds {0} report(s) but {1} subscription(s) are accounted for in this run." -f $SubZips.Count, $AccountedFor) -ForegroundColor Yellow
+            Write-Host "Reports for subscriptions completed by an earlier run may be missing from the bundle." -ForegroundColor Yellow
+        }
     }
     else
     {
@@ -1744,6 +1789,7 @@ if ($null -ne $OuterZipFile)
         }
         catch { Write-Verbose ("MainSummary: could not read Version.json: {0}" -f $_.Exception.Message) }
         New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime `
+            -IncludeFolder $RecordedSubDirs `
             -FailedSubscriptions $FailedSubscriptions `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
@@ -2095,9 +2141,10 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
         #    'ResourcesReport' replaced by 'HTML'), matching the rewritten
         #    summary links. HTML only - no *.json/csv - so nothing is
         #    double-ingested and the folder name signals "report HTML, not
-        #    data". Scoped to THIS run by timestamp; a de-obfuscated
-        #    *_revealed* report is never copied across.
-        foreach ($SubDir in @(Get-ChildItem -Path $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime }))
+        #    data". Scoped to this logical run - folders written now, plus
+        #    those recorded by an earlier run; a de-obfuscated *_revealed*
+        #    report is never copied across.
+        foreach ($SubDir in @(Get-ChildItem -Path $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime -or $RecordedSubDirs -contains $_.FullName }))
         {
             $SubHtml = Get-ChildItem -Path $SubDir.FullName -Filter '*.html' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*_revealed*' } | Select-Object -First 1
             if ($null -eq $SubHtml) { continue }

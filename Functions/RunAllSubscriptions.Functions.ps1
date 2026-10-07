@@ -513,13 +513,42 @@ function Get-FailedAttempts
     }
 }
 
+# Read the CompletedSubscriptions list out of the resume-state file. Returns
+# an array of objects shaped { Id, Name, ZipPath, CompletedAt }, or an empty
+# array if the file is absent, malformed, or for a different tenant.
+# Backward-compatible: a state file written before this key existed reads back
+# as empty, in which case the caller falls back to timestamp-only selection.
+function Get-CompletedSubscriptions
+{
+    param([string]$Path, [string]$Tenant)
+
+    if (-not (Test-Path -Path $Path -PathType Leaf)) { return @() }
+    try
+    {
+        $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        if ($State.TenantID -ne $Tenant) { return @() }
+        if ($null -eq $State.CompletedSubscriptions) { return @() }
+        return @($State.CompletedSubscriptions)
+    }
+    catch
+    {
+        return @()
+    }
+}
+
 function Save-CompletedSubscriptionIds
 {
-    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @())
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), $Completed = @())
 
     $State = [pscustomobject]@{
         TenantID                  = $Tenant
         CompletedSubscriptionIds  = @($Ids)
+        # CompletedSubscriptions carries the per-sub report ZIP path alongside
+        # the Id. Per-sub output folders are named ResourcesReport<stamp><pid>
+        # with no subscription Id in them, so without this record a later
+        # -Resume run cannot tell which on-disk ZIPs belong to the run and
+        # consolidates only what it wrote itself.
+        CompletedSubscriptions    = @($Completed)
         # FailedAttempts is the canonical "what to retry" list. The wrapper
         # appends/refreshes entries on every catch and removes them on the
         # next successful attempt for the same sub, so the file is always
@@ -601,6 +630,80 @@ function Remove-FailedAttempt
         [string]$Id
     )
     return @($Existing | Where-Object { $_ -and $_.Id -ne $Id })
+}
+
+# Record (or refresh) one sub's completed-report entry. Re-running a sub that
+# already completed replaces its entry so the list never holds a stale ZIP path.
+function Add-CompletedSubscription
+{
+    param(
+        # [object] for the same single-element collapse reason as Add-FailedAttempt.
+        [object]$Existing,
+        [string]$Id,
+        [string]$Name,
+        [string]$ZipPath
+    )
+
+    $Kept = @($Existing | Where-Object { $_ -and $_.Id -ne $Id })
+    $Entry = [pscustomobject]@{
+        Id          = $Id
+        Name        = $Name
+        ZipPath     = $ZipPath
+        CompletedAt = (Get-Date).ToString('o')
+    }
+    return @($Kept) + @($Entry)
+}
+
+# Build the set of per-subscription ZIPs that belong to one logical run.
+#
+# Two sources, unioned:
+#   - ZIPs written by THIS invocation (LastWriteTime >= $SinceTime).
+#   - ZIPs recorded in the resume state by EARLIER invocations of the same run.
+#
+# The timestamp arm alone is what truncated the bundle on -Resume: subs skipped
+# as already-complete keep their original LastWriteTime and fall outside the
+# window. The timestamp arm is still needed because a sub that ran this
+# invocation is not in the recorded list until its state write lands.
+#
+# Recorded paths that no longer exist are skipped with a warning rather than
+# failing the run - the bundle is still better with the remaining reports, and
+# the caller's count check surfaces the shortfall.
+function Get-ConsolidationZipSet
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][datetime]$SinceTime,
+        [object]$RecordedCompleted = @()
+    )
+
+    if (-not (Test-Path -Path $InventoryRoot -PathType Container)) { return @() }
+
+    $Found = [ordered]@{}
+
+    $SubDirs = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue)
+    foreach ($Dir in $SubDirs)
+    {
+        $ThisRun = @(Get-ChildItem -Path $Dir.FullName -Filter '*.zip' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $SinceTime })
+        foreach ($Zip in $ThisRun)
+        {
+            $Found[$Zip.FullName] = $true
+        }
+    }
+
+    foreach ($Entry in @($RecordedCompleted | Where-Object { $_ -and $_.ZipPath }))
+    {
+        if ($Found.Contains($Entry.ZipPath)) { continue }
+        if (Test-Path -LiteralPath $Entry.ZipPath -PathType Leaf)
+        {
+            $Found[$Entry.ZipPath] = $true
+        }
+        else
+        {
+            Write-Host ("WARNING: Report for a previously completed subscription is missing; it will not be in the bundle: {0}" -f $Entry.ZipPath) -ForegroundColor Yellow
+        }
+    }
+
+    return @($Found.Keys)
 }
 
 # Discover every per-stream resume-state file on disk for a tenant, rather
@@ -770,7 +873,7 @@ function Write-Stream
 function Read-StreamState
 {
     param([string]$Path)
-    if (-not (Test-Path -Path $Path -PathType Leaf)) { return @{ Completed = @(); Failed = @() } }
+    if (-not (Test-Path -Path $Path -PathType Leaf)) { return @{ Completed = @(); Failed = @(); Reports = @() } }
     try
     {
         $Obj = Get-Content -Path $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -779,25 +882,29 @@ function Read-StreamState
             # Backward-compatible: state files written by an older worker had
             # no FailedAttempts key, so default to @().
             Failed    = if ($null -eq $Obj.FailedAttempts) { @() } else { @($Obj.FailedAttempts) }
+            Reports   = if ($null -eq $Obj.CompletedReports) { @() } else { @($Obj.CompletedReports) }
         }
     }
     catch
     {
         Write-Stream ("WARNING: could not read stream state at {0}: {1}" -f $Path, $_.Exception.Message) 'Yellow'
-        return @{ Completed = @(); Failed = @() }
+        return @{ Completed = @(); Failed = @(); Reports = @() }
     }
 }
 
 function Write-StreamState
 {
-    param([string]$Path, [string[]]$Completed, $FailedAttempts = @())
+    param([string]$Path, [string[]]$Completed, $FailedAttempts = @(), $CompletedReports = @())
     try
     {
         @{
-            Tenant         = $TenantID
-            StreamId       = $StreamId
-            Completed      = $Completed
-            FailedAttempts = @($FailedAttempts)
+            Tenant           = $TenantID
+            StreamId         = $StreamId
+            Completed        = $Completed
+            # Per-sub report ZIP paths, merged into the unified resume state by
+            # the wrapper so consolidation can find this stream's output.
+            CompletedReports = @($CompletedReports)
+            FailedAttempts   = @($FailedAttempts)
         } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
     }
     catch

@@ -150,6 +150,7 @@ if ($Resume -or $ResumeFailedOnly)
     $State = Read-StreamState -Path $StreamStateFile
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
+    $CompletedReports = @($State.Reports)
     if ($CompletedIds.Count -gt 0)
     {
         Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedIds.Count) 'DarkGray'
@@ -179,6 +180,7 @@ $ResourceCounts = @()
 # new array each time. Cheaper than fighting [List[T]]::new() constructor
 # overload resolution against an empty PowerShell array argument.
 $Completed = @($CompletedIds)
+if ($null -eq $CompletedReports) { $CompletedReports = @() }
 $FailedSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
@@ -220,6 +222,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
     try
     {
+        # Cleared before the call for the same reason as the sequential path:
+        # the global persists across iterations under `&`.
+        $Global:ZipOutputFile = $null
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -243,14 +248,18 @@ for ($i = 0; $i -lt $PairCount; $i++)
             Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
         }
 
+        if (-not [string]::IsNullOrWhiteSpace($Global:ZipOutputFile))
+        {
+            $CompletedReports = Add-CompletedSubscription -Existing $CompletedReports -Id $SubId -Name $SubName -ZipPath $Global:ZipOutputFile
+        }
         if (-not ($Completed -contains $SubId))
         {
             $Completed += $SubId
             # If this is a retry that finally succeeded, drop the sub from
             # FailedAttempts so the unified resume-state file reflects truth.
             $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $SubId
-            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
         }
+        Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -CompletedReports $CompletedReports
     }
     catch
     {
@@ -325,6 +334,7 @@ $Summary = [pscustomobject]@{
     Status                 = if ($FailedSubs.Count -eq 0) { 'ok' } else { 'partial-failure' }
     SubsProcessed          = $PairCount
     Completed              = @($Completed)
+    CompletedReports       = @($CompletedReports)
     Failed                 = $FailedSubs
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
